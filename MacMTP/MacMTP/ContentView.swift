@@ -3,7 +3,7 @@ import SwiftUI
 struct ContentView: View {
     @StateObject private var localViewModel = LocalBrowserViewModel()
     @StateObject private var mtpViewModel = MTPBrowserViewModel()
-    
+
     var body: some View {
         HSplitView {
             FileBrowserPaneView(
@@ -19,9 +19,9 @@ struct ContentView: View {
                 canGoForward: localViewModel.canGoForward
             )
             .frame(minWidth: 300)
-            
+
             FileBrowserPaneView(
-                title: "Phone (MTP)",
+                title: mtpViewModel.isConnected ? "Phone (MTP)" : "Phone (MTP) - Connecting...",
                 currentPath: mtpViewModel.currentPath,
                 files: mtpViewModel.files,
                 isLoading: mtpViewModel.isLoading,
@@ -44,6 +44,9 @@ struct ContentView: View {
                     Label("Refresh", systemImage: "arrow.clockwise")
                 }
             }
+        }
+        .task {
+            await mtpViewModel.connect()
         }
     }
 }
