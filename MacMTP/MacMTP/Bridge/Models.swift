@@ -80,6 +80,11 @@ struct MTPResponse: Decodable {
     let message: String?
 }
 
+struct MTPProgressEntry: Codable {
+    let bytes: Int64
+    let total: Int64?
+}
+
 enum MTPResponseData: Decodable {
     case devices([MTPDeviceEntry])
     case storages([MTPStorageEntry])

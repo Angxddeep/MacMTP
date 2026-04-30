@@ -44,6 +44,8 @@ pub struct Response {
 pub enum ResponseStatus {
     #[serde(rename = "ok")]
     Ok { data: serde_json::Value },
+    #[serde(rename = "progress")]
+    Progress { data: serde_json::Value },
     #[serde(rename = "error")]
     Error { message: String },
 }

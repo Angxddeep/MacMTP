@@ -78,8 +78,16 @@ final class MTPBridge: @unchecked Sendable {
     }
 
     /// Download a file from the MTP device to a local destination.
-    func download(path: String, to localDest: String) async throws -> Int {
-        let response = try await send(.download(path: path, dest: localDest))
+    func download(
+        path: String,
+        to localDest: String,
+        onProgress: (@Sendable (MTPProgressEntry) -> Void)? = nil
+    ) async throws -> Int {
+        let response = try await send(
+            .download(path: path, dest: localDest),
+            timeout: nil,
+            onProgress: onProgress
+        )
         guard response.status == "ok" else {
             throw MTPError.requestFailed(response.message ?? "download failed")
         }
@@ -91,8 +99,16 @@ final class MTPBridge: @unchecked Sendable {
     }
 
     /// Upload a local file to the MTP device.
-    func upload(localPath: String, to devicePath: String) async throws -> Int {
-        let response = try await send(.upload(src: localPath, destPath: devicePath))
+    func upload(
+        localPath: String,
+        to devicePath: String,
+        onProgress: (@Sendable (MTPProgressEntry) -> Void)? = nil
+    ) async throws -> Int {
+        let response = try await send(
+            .upload(src: localPath, destPath: devicePath),
+            timeout: nil,
+            onProgress: onProgress
+        )
         guard response.status == "ok" else {
             throw MTPError.requestFailed(response.message ?? "upload failed")
         }
@@ -142,7 +158,11 @@ final class MTPBridge: @unchecked Sendable {
     // MARK: - Private
 
     @discardableResult
-    private func send(_ request: MTPRequest) async throws -> MTPResponse {
-        try await process.send(request)
+    private func send(
+        _ request: MTPRequest,
+        timeout: TimeInterval? = MTPProcess.requestTimeout,
+        onProgress: (@Sendable (MTPProgressEntry) -> Void)? = nil
+    ) async throws -> MTPResponse {
+        try await process.send(request, timeout: timeout, onProgress: onProgress)
     }
 }

@@ -8,6 +8,7 @@ use protocol::*;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
 // FFI to IOKit helper that seizes USB devices from the macOS kernel driver.
@@ -52,6 +53,18 @@ fn err(id: u64, msg: impl Into<String>) {
     );
 }
 
+fn progress(id: u64, bytes: u64, total: Option<u64>) {
+    send_response(
+        id,
+        ResponseStatus::Progress {
+            data: serde_json::json!({
+                "bytes": bytes,
+                "total": total,
+            }),
+        },
+    );
+}
+
 async fn ensure_connected(state: &Arc<RwLock<DaemonState>>) -> Result<(), String> {
     {
         let st = state.read().await;
@@ -64,13 +77,14 @@ async fn ensure_connected(state: &Arc<RwLock<DaemonState>>) -> Result<(), String
     // We must seize the device via IOKit to release the kernel driver's hold.
     #[cfg(target_os = "macos")]
     {
-        let devices = MtpDevice::list_devices()
-            .map_err(|e| format!("Failed to list devices: {e}"))?;
+        let devices =
+            MtpDevice::list_devices().map_err(|e| format!("Failed to list devices: {e}"))?;
 
         if let Some(info) = devices.first() {
-            let serial_c = info.serial_number.as_ref().map(|s| {
-                std::ffi::CString::new(s.as_str()).unwrap_or_default()
-            });
+            let serial_c = info
+                .serial_number
+                .as_ref()
+                .map(|s| std::ffi::CString::new(s.as_str()).unwrap_or_default());
 
             let serial_ptr = serial_c
                 .as_ref()
@@ -81,9 +95,7 @@ async fn ensure_connected(state: &Arc<RwLock<DaemonState>>) -> Result<(), String
                 "Seizing USB device {:04x}:{:04x}...",
                 info.vendor_id, info.product_id
             );
-            let result = unsafe {
-                seize_usb_device(info.vendor_id, info.product_id, serial_ptr)
-            };
+            let result = unsafe { seize_usb_device(info.vendor_id, info.product_id, serial_ptr) };
             if result == 0 {
                 eprintln!("Device seized successfully, waiting for release...");
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -109,9 +121,10 @@ async fn ensure_connected(state: &Arc<RwLock<DaemonState>>) -> Result<(), String
             {
                 let devices = MtpDevice::list_devices().unwrap_or_default();
                 if let Some(info) = devices.first() {
-                    let serial_c = info.serial_number.as_ref().map(|s| {
-                        std::ffi::CString::new(s.as_str()).unwrap_or_default()
-                    });
+                    let serial_c = info
+                        .serial_number
+                        .as_ref()
+                        .map(|s| std::ffi::CString::new(s.as_str()).unwrap_or_default());
                     let serial_ptr = serial_c
                         .as_ref()
                         .map(|c| c.as_ptr())
@@ -208,13 +221,13 @@ async fn handle_request(req: Request, id: u64, state: &Arc<RwLock<DaemonState>>)
                 let entries: Vec<DeviceEntry> = devices
                     .into_iter()
                     .map(|d| DeviceEntry {
-                            name: format!(
-                                "{} {}",
-                                d.manufacturer.clone().unwrap_or_default(),
-                                d.product.clone().unwrap_or_default()
-                            ),
-                            serial: d.serial_number.unwrap_or_default(),
-                            vendor: d.manufacturer.unwrap_or_default(),
+                        name: format!(
+                            "{} {}",
+                            d.manufacturer.clone().unwrap_or_default(),
+                            d.product.clone().unwrap_or_default()
+                        ),
+                        serial: d.serial_number.unwrap_or_default(),
+                        vendor: d.manufacturer.unwrap_or_default(),
                         product: d.product.unwrap_or_default(),
                         location_id: d.location_id as u32,
                     })
@@ -315,24 +328,60 @@ async fn handle_request(req: Request, id: u64, state: &Arc<RwLock<DaemonState>>)
             let parent = parent_path(&path);
             let target_name = file_name(&path);
 
-            let handle = match find_object_handle(storage, parent, target_name).await {
-                Some(h) => h,
+            let parent_handle = find_dir_handle(storage, parent).await;
+            let objects = match storage.list_objects(parent_handle).await {
+                Ok(objs) => objs,
+                Err(e) => {
+                    err(id, format!("Failed to list directory: {e}"));
+                    return;
+                }
+            };
+
+            let obj = match objects.into_iter().find(|o| o.filename == target_name) {
+                Some(o) => o,
                 None => {
                     err(id, format!("File not found: {path}"));
                     return;
                 }
             };
 
-            match storage.download(handle).await {
-                Ok(data) => {
-                    if let Err(e) = std::fs::write(&dest, &data) {
-                        err(id, format!("Failed to write file: {e}"));
-                    } else {
-                        ok(id, serde_json::json!({"bytes": data.len(), "dest": dest}));
+            let mut file = match tokio::fs::File::create(&dest).await {
+                Ok(f) => f,
+                Err(e) => {
+                    err(id, format!("Failed to create local file: {e}"));
+                    return;
+                }
+            };
+
+            let mut stream = match storage.download_stream(obj.handle).await {
+                Ok(s) => s,
+                Err(e) => {
+                    err(id, format!("Download failed: {e}"));
+                    return;
+                }
+            };
+
+            progress(id, 0, Some(obj.size));
+            let mut downloaded = 0;
+
+            while let Some(chunk_result) = stream.next_chunk().await {
+                match chunk_result {
+                    Ok(chunk) => {
+                        if let Err(e) = file.write_all(&chunk).await {
+                            err(id, format!("Failed to write to local file: {e}"));
+                            return;
+                        }
+                        downloaded += chunk.len() as u64;
+                        progress(id, downloaded, Some(obj.size));
+                    }
+                    Err(e) => {
+                        err(id, format!("Download stream error: {e}"));
+                        return;
                     }
                 }
-                Err(e) => err(id, format!("Download failed: {e}")),
             }
+
+            ok(id, serde_json::json!({"bytes": downloaded, "dest": dest}));
         }
 
         Request::Upload { src, dest_path } => {
@@ -341,10 +390,18 @@ async fn handle_request(req: Request, id: u64, state: &Arc<RwLock<DaemonState>>)
                 return;
             }
 
-            let data = match std::fs::read(&src) {
-                Ok(d) => d,
+            let file = match tokio::fs::File::open(&src).await {
+                Ok(file) => file,
                 Err(e) => {
-                    err(id, format!("Failed to read source file: {e}"));
+                    err(id, format!("Failed to open source file: {e}"));
+                    return;
+                }
+            };
+
+            let size = match file.metadata().await {
+                Ok(metadata) => metadata.len(),
+                Err(e) => {
+                    err(id, format!("Failed to inspect source file: {e}"));
                     return;
                 }
             };
@@ -362,10 +419,23 @@ async fn handle_request(req: Request, id: u64, state: &Arc<RwLock<DaemonState>>)
             let parent_handle = find_dir_handle(storage, parent).await;
 
             let fname = file_name(&dest_path).to_string();
-            let size = data.len() as u64;
             let info = NewObjectInfo::file(&fname, size);
-            let data_bytes = Bytes::from(data);
-            let byte_stream = stream::iter(vec![Ok::<_, std::io::Error>(data_bytes)]);
+            progress(id, 0, Some(size));
+
+            let byte_stream =
+                stream::unfold((file, 0_u64), move |(mut file, mut sent)| async move {
+                    let mut buffer = vec![0_u8; 1_048_576];
+                    match file.read(&mut buffer).await {
+                        Ok(0) => None,
+                        Ok(read_bytes) => {
+                            buffer.truncate(read_bytes);
+                            sent += read_bytes as u64;
+                            progress(id, sent, Some(size));
+                            Some((Ok::<_, std::io::Error>(Bytes::from(buffer)), (file, sent)))
+                        }
+                        Err(error) => Some((Err(error), (file, sent))),
+                    }
+                });
 
             match storage
                 .upload(parent_handle, info, Box::pin(byte_stream))
@@ -499,10 +569,7 @@ async fn find_object_handle(
     None
 }
 
-async fn find_dir_handle(
-    storage: &Storage,
-    path: &str,
-) -> Option<mtp_rs::ptp::ObjectHandle> {
+async fn find_dir_handle(storage: &Storage, path: &str) -> Option<mtp_rs::ptp::ObjectHandle> {
     let trimmed = path.trim_start_matches('/');
     let parts: Vec<&str> = trimmed.split('/').collect();
 

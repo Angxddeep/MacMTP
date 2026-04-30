@@ -9,6 +9,7 @@ class LocalBrowserViewModel: ObservableObject {
     @Published var errorMessage: String? = nil
     
     private let fileManager = FileManager.default
+    private let transferStore = TransferProgressStore.shared
     private var history: [String] = []
     private var historyIndex: Int = -1
     
@@ -105,6 +106,152 @@ class LocalBrowserViewModel: ObservableObject {
                 self.errorMessage = error.localizedDescription
                 self.isLoading = false
             }
+        }
+    }
+
+    func copyLocalFiles(_ urls: [URL], toDirectory directoryPath: String) async {
+        guard !urls.isEmpty else { return }
+
+        do {
+            for url in urls {
+                let destinationURL = try availableDestinationURL(
+                    forName: url.lastPathComponent,
+                    inDirectory: directoryPath
+                )
+                try await copyFileWithProgress(from: url, to: destinationURL)
+            }
+            errorMessage = nil
+            loadFiles()
+        } catch {
+            errorMessage = "Copy failed: \(error.localizedDescription)"
+        }
+    }
+
+    func importDraggedItems(
+        _ items: [FileDragItem],
+        toDirectory directoryPath: String,
+        mtpViewModel: MTPBrowserViewModel
+    ) async {
+        guard !items.isEmpty else { return }
+
+        do {
+            for item in items {
+                switch item.origin {
+                case .local:
+                    let sourceURL = URL(fileURLWithPath: item.path)
+                    let destinationURL = try availableDestinationURL(
+                        forName: sourceURL.lastPathComponent,
+                        inDirectory: directoryPath
+                    )
+                    try await copyFileWithProgress(from: sourceURL, to: destinationURL)
+                case .mtp:
+                    guard !item.isDirectory else {
+                        throw LocalFileTransferError.unsupportedDirectoryTransfer(item.name)
+                    }
+
+                    let destinationURL = try availableDestinationURL(
+                        forName: item.name,
+                        inDirectory: directoryPath
+                    )
+                    try await mtpViewModel.downloadFile(
+                        devicePath: item.path,
+                        localPath: destinationURL.path,
+                        displayName: item.name
+                    )
+                }
+            }
+            errorMessage = nil
+            loadFiles()
+        } catch {
+            errorMessage = "Drop failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func availableDestinationURL(forName name: String, inDirectory directoryPath: String) throws -> URL {
+        let directoryURL = URL(fileURLWithPath: directoryPath, isDirectory: true)
+        let proposedURL = directoryURL.appendingPathComponent(name)
+
+        guard fileManager.fileExists(atPath: proposedURL.path) else {
+            return proposedURL
+        }
+
+        let baseName = (name as NSString).deletingPathExtension
+        let fileExtension = (name as NSString).pathExtension
+
+        for copyIndex in 1...10_000 {
+            let candidateName: String
+            if fileExtension.isEmpty {
+                candidateName = "\(baseName) copy \(copyIndex)"
+            } else {
+                candidateName = "\(baseName) copy \(copyIndex).\(fileExtension)"
+            }
+
+            let candidateURL = directoryURL.appendingPathComponent(candidateName)
+            if !fileManager.fileExists(atPath: candidateURL.path) {
+                return candidateURL
+            }
+        }
+
+        throw LocalFileTransferError.noAvailableDestination(name)
+    }
+
+    private func copyFileWithProgress(from sourceURL: URL, to destinationURL: URL) async throws {
+        var isDirectory: ObjCBool = false
+        fileManager.fileExists(atPath: sourceURL.path, isDirectory: &isDirectory)
+        guard !isDirectory.boolValue else {
+            throw LocalFileTransferError.unsupportedDirectoryTransfer(sourceURL.lastPathComponent)
+        }
+
+        let totalBytes = try fileManager.attributesOfItem(atPath: sourceURL.path)[.size] as? Int64 ?? 0
+        let jobID = transferStore.startJob(
+            title: "Copying \(sourceURL.lastPathComponent)",
+            detail: destinationURL.deletingLastPathComponent().path,
+            totalBytes: totalBytes
+        )
+
+        do {
+            try await Task.detached(priority: .userInitiated) {
+                let input = try FileHandle(forReadingFrom: sourceURL)
+                defer { try? input.close() }
+
+                FileManager.default.createFile(atPath: destinationURL.path, contents: nil)
+                let output = try FileHandle(forWritingTo: destinationURL)
+                defer { try? output.close() }
+
+                var copiedBytes: Int64 = 0
+                while true {
+                    try Task.checkCancellation()
+                    let data = try input.read(upToCount: 1_048_576) ?? Data()
+                    guard !data.isEmpty else { break }
+                    try output.write(contentsOf: data)
+                    copiedBytes += Int64(data.count)
+
+                    let progressBytes = copiedBytes
+                    await MainActor.run {
+                        self.transferStore.updateJob(jobID, completedBytes: progressBytes)
+                    }
+                }
+            }.value
+
+            transferStore.finishJob(jobID, detail: destinationURL.path)
+        } catch {
+            try? fileManager.removeItem(at: destinationURL)
+            transferStore.failJob(jobID, message: error.localizedDescription)
+            throw error
+        }
+    }
+}
+
+private enum LocalFileTransferError: LocalizedError {
+    case noAvailableDestination(String)
+    case unsupportedDirectoryTransfer(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .noAvailableDestination(let name):
+            return "Could not find an available destination name for \(name)."
+        case .unsupportedDirectoryTransfer(let name):
+            return "Folder transfer is not supported yet for \(name)."
         }
     }
 }

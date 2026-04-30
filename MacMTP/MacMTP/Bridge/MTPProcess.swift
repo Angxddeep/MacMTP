@@ -6,10 +6,14 @@ final class MTPProcess: @unchecked Sendable {
     private let stdinPipe = Pipe()
     private let stdoutPipe = Pipe()
     private let stderrPipe = Pipe()
+    private let lifecycleLock = NSLock()
+    private var didLaunch = false
+    private var didStop = false
 
     private struct PendingRequest {
         let continuation: CheckedContinuation<MTPResponse, Error>
-        let timeoutTask: Task<Void, Never>
+        let timeoutTask: Task<Void, Never>?
+        let progressHandler: (@Sendable (MTPProgressEntry) -> Void)?
     }
 
     private var pendingRequests: [UInt64: PendingRequest] = [:]
@@ -26,7 +30,9 @@ final class MTPProcess: @unchecked Sendable {
     static let requestTimeout: TimeInterval = 30
 
     var isRunning: Bool {
-        process.isRunning
+        lifecycleLock.withLock {
+            didLaunch && !didStop && process.isRunning
+        }
     }
 
     /// Kill any existing mtp-daemon processes that may be holding USB devices.
@@ -79,17 +85,37 @@ final class MTPProcess: @unchecked Sendable {
             }
         }
 
-        try process.run()
+        do {
+            try process.run()
+            lifecycleLock.withLock {
+                didLaunch = true
+                didStop = false
+            }
+        } catch {
+            stdoutPipe.fileHandleForReading.readabilityHandler = nil
+            stderrPipe.fileHandleForReading.readabilityHandler = nil
+            throw error
+        }
 
         // Wait for the ready message
         // The daemon sends a ready message on startup
     }
 
     func stop() {
-        process.terminate()
-        stdinPipe.fileHandleForWriting.closeFile()
+        let shouldTerminate = lifecycleLock.withLock {
+            guard !didStop else { return false }
+            didStop = true
+            return didLaunch && process.isRunning
+        }
+
         stdoutPipe.fileHandleForReading.readabilityHandler = nil
         stderrPipe.fileHandleForReading.readabilityHandler = nil
+
+        if shouldTerminate {
+            process.terminate()
+        }
+
+        stdinPipe.fileHandleForWriting.closeFile()
 
         // Fail all pending requests so callers aren't left hanging
         lock.lock()
@@ -98,12 +124,20 @@ final class MTPProcess: @unchecked Sendable {
         lock.unlock()
 
         for (_, pending) in allPending {
-            pending.timeoutTask.cancel()
+            pending.timeoutTask?.cancel()
             pending.continuation.resume(throwing: MTPError.notConnected)
         }
     }
 
-    func send(_ request: MTPRequest) async throws -> MTPResponse {
+    func send(
+        _ request: MTPRequest,
+        timeout: TimeInterval? = MTPProcess.requestTimeout,
+        onProgress: (@Sendable (MTPProgressEntry) -> Void)? = nil
+    ) async throws -> MTPResponse {
+        guard isRunning else {
+            throw MTPError.notConnected
+        }
+
         let id = lock.withLock {
             let id = nextId
             nextId += 1
@@ -111,16 +145,22 @@ final class MTPProcess: @unchecked Sendable {
         }
 
         let response: MTPResponse = try await withCheckedThrowingContinuation { continuation in
-            let timeoutTask = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: UInt64(MTPProcess.requestTimeout * 1_000_000_000))
-                guard !Task.isCancelled else { return }
-                self?.timeoutRequest(id: id)
+            let timeoutTask: Task<Void, Never>?
+            if let timeout = timeout {
+                timeoutTask = Task { [weak self] in
+                    try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                    guard !Task.isCancelled else { return }
+                    self?.timeoutRequest(id: id)
+                }
+            } else {
+                timeoutTask = nil
             }
 
             lock.withLock {
                 pendingRequests[id] = PendingRequest(
                     continuation: continuation,
-                    timeoutTask: timeoutTask
+                    timeoutTask: timeoutTask,
+                    progressHandler: onProgress
                 )
             }
 
@@ -133,7 +173,7 @@ final class MTPProcess: @unchecked Sendable {
                 lock.lock()
                 let pending = pendingRequests.removeValue(forKey: id)
                 lock.unlock()
-                pending?.timeoutTask.cancel()
+                pending?.timeoutTask?.cancel()
                 continuation.resume(throwing: error)
             }
         }
@@ -174,12 +214,22 @@ final class MTPProcess: @unchecked Sendable {
                 let response = try JSONDecoder().decode(MTPResponse.self, from: lineData)
                 let id = response.id
 
+                if response.status == "progress" {
+                    if let progress = response.progressEntry {
+                        lock.lock()
+                        let handler = pendingRequests[id]?.progressHandler
+                        lock.unlock()
+                        handler?(progress)
+                    }
+                    continue
+                }
+
                 lock.lock()
                 let pending = pendingRequests.removeValue(forKey: id)
                 lock.unlock()
 
                 if let pending = pending {
-                    pending.timeoutTask.cancel()
+                    pending.timeoutTask?.cancel()
                     pending.continuation.resume(returning: response)
                 }
             } catch {
@@ -268,6 +318,25 @@ private enum AnyEncodableValue: Encodable {
         switch self {
         case .string(let v): try container.encode(v)
         }
+    }
+}
+
+private extension MTPResponse {
+    var progressEntry: MTPProgressEntry? {
+        guard case .generic(let data) = data,
+              case .int(let bytes)? = data["bytes"]
+        else {
+            return nil
+        }
+
+        let total: Int64?
+        if case .int(let value)? = data["total"] {
+            total = Int64(value)
+        } else {
+            total = nil
+        }
+
+        return MTPProgressEntry(bytes: Int64(bytes), total: total)
     }
 }
 

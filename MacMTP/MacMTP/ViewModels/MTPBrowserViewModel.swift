@@ -12,6 +12,7 @@ class MTPBrowserViewModel: ObservableObject {
     private var history: [String] = []
     private var historyIndex: Int = -1
     private let bridge = MTPBridge()
+    private let transferStore = TransferProgressStore.shared
     private var hasConnected = false
 
     var canGoBack: Bool { historyIndex > 0 }
@@ -109,14 +110,76 @@ class MTPBrowserViewModel: ObservableObject {
     }
 
     /// Download a file from the MTP device to a local path.
-    func downloadFile(devicePath: String, localPath: String) async throws {
-        _ = try await bridge.download(path: devicePath, to: localPath)
+    func downloadFile(devicePath: String, localPath: String, displayName: String? = nil) async throws {
+        let name = displayName ?? (devicePath as NSString).lastPathComponent
+        let jobID = transferStore.startJob(
+            title: "Downloading \(name)",
+            detail: localPath,
+            totalBytes: nil
+        )
+
+        do {
+            _ = try await bridge.download(path: devicePath, to: localPath) { progress in
+                Task { @MainActor in
+                    self.transferStore.updateJob(jobID, completedBytes: progress.bytes)
+                }
+            }
+            transferStore.finishJob(jobID, detail: localPath)
+        } catch {
+            transferStore.failJob(jobID, message: error.localizedDescription)
+            throw error
+        }
     }
 
     /// Upload a local file to the MTP device.
     func uploadFile(localPath: String, devicePath: String) async throws {
-        _ = try await bridge.upload(localPath: localPath, to: devicePath)
+        try await uploadFileWithProgress(localPath: localPath, devicePath: devicePath)
         loadFiles()
+    }
+
+    func uploadLocalFiles(_ urls: [URL], toDirectory directoryPath: String) async {
+        guard !urls.isEmpty else { return }
+
+        do {
+            for url in urls {
+                var isDirectory: ObjCBool = false
+                FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory)
+                guard !isDirectory.boolValue else {
+                    throw MTPFileTransferError.unsupportedDirectoryTransfer(url.lastPathComponent)
+                }
+
+                let destinationPath = Self.joinPath(directoryPath, url.lastPathComponent)
+                try await uploadFileWithProgress(localPath: url.path, devicePath: destinationPath)
+            }
+            errorMessage = nil
+            loadFiles()
+        } catch {
+            errorMessage = "Upload failed: \(error.localizedDescription)"
+        }
+    }
+
+    func importDraggedItems(_ items: [FileDragItem], toDirectory directoryPath: String) async {
+        guard !items.isEmpty else { return }
+
+        do {
+            for item in items {
+                switch item.origin {
+                case .local:
+                    guard !item.isDirectory else {
+                        throw MTPFileTransferError.unsupportedDirectoryTransfer(item.name)
+                    }
+
+                    let destinationPath = Self.joinPath(directoryPath, item.name)
+                    try await uploadFileWithProgress(localPath: item.path, devicePath: destinationPath)
+                case .mtp:
+                    throw MTPFileTransferError.sameDeviceMoveNotSupported
+                }
+            }
+            errorMessage = nil
+            loadFiles()
+        } catch {
+            errorMessage = "Drop failed: \(error.localizedDescription)"
+        }
     }
 
     /// Create a directory on the MTP device.
@@ -154,5 +217,48 @@ class MTPBrowserViewModel: ObservableObject {
         if let date = iso8601Formatter.date(from: string) { return date }
         if let date = mtpDateFormatter.date(from: string) { return date }
         return Date()
+    }
+
+    private static func joinPath(_ directoryPath: String, _ name: String) -> String {
+        if directoryPath.hasSuffix("/") {
+            return "\(directoryPath)\(name)"
+        }
+        return "\(directoryPath)/\(name)"
+    }
+
+    private func uploadFileWithProgress(localPath: String, devicePath: String) async throws {
+        let name = (localPath as NSString).lastPathComponent
+        let totalBytes = (try? FileManager.default.attributesOfItem(atPath: localPath)[.size] as? Int64) ?? 0
+        let jobID = transferStore.startJob(
+            title: "Uploading \(name)",
+            detail: devicePath,
+            totalBytes: totalBytes
+        )
+
+        do {
+            _ = try await bridge.upload(localPath: localPath, to: devicePath) { progress in
+                Task { @MainActor in
+                    self.transferStore.updateJob(jobID, completedBytes: progress.bytes)
+                }
+            }
+            transferStore.finishJob(jobID, detail: devicePath)
+        } catch {
+            transferStore.failJob(jobID, message: error.localizedDescription)
+            throw error
+        }
+    }
+}
+
+private enum MTPFileTransferError: LocalizedError {
+    case sameDeviceMoveNotSupported
+    case unsupportedDirectoryTransfer(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .sameDeviceMoveNotSupported:
+            return "Moving files inside the phone is not supported yet."
+        case .unsupportedDirectoryTransfer(let name):
+            return "Folder transfer is not supported yet for \(name)."
+        }
     }
 }

@@ -38,5 +38,8 @@ struct MacMTPApp: App {
         WindowGroup {
             ContentView()
         }
+        .commands {
+            BrowserCommands()
+        }
     }
 }
