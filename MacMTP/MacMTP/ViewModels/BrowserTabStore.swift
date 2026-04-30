@@ -29,6 +29,12 @@ final class BrowserTab: ObservableObject, Identifiable {
                 }
             }
             .store(in: &cancellables)
+            
+        // Automatically start MTP connection in the background so it's ready 
+        // when the user clicks the Android icon.
+        Task {
+            await mtpViewModel.connect()
+        }
     }
 
     var title: String {

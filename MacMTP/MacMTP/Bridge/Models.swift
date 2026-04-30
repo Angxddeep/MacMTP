@@ -6,16 +6,16 @@ enum MTPRequest: Encodable {
     case ping
     case listDevices
     case listStorages
-    case listFiles(path: String)
-    case download(path: String, dest: String)
-    case upload(src: String, destPath: String)
-    case mkdir(path: String, name: String)
-    case delete(path: String)
-    case rename(path: String, newName: String)
+    case listFiles(path: String, handle: UInt32?, storageId: UInt32?)
+    case download(path: String, dest: String, handle: UInt32?)
+    case upload(src: String, destPath: String, parentHandle: UInt32?)
+    case mkdir(path: String, name: String, parentHandle: UInt32?)
+    case delete(path: String, handle: UInt32?)
+    case rename(path: String, newName: String, handle: UInt32?)
     case deviceInfo
 
     private enum CodingKeys: String, CodingKey {
-        case command, id, path, dest, src, destPath, name, newName
+        case command, id, path, dest, src, destPath, name, newName, handle, storage_id, parent_handle
     }
 
     func encode(to encoder: Encoder) throws {
@@ -28,28 +28,49 @@ enum MTPRequest: Encodable {
             try container.encode("list_devices", forKey: DynamicKey(stringValue: "command")!)
         case .listStorages:
             try container.encode("list_storages", forKey: DynamicKey(stringValue: "command")!)
-        case .listFiles(let path):
+        case .listFiles(let path, let handle, let storageId):
             try container.encode("list_files", forKey: DynamicKey(stringValue: "command")!)
             try container.encode(path, forKey: DynamicKey(stringValue: "path")!)
-        case .download(let path, let dest):
+            if let handle = handle {
+                try container.encode(handle, forKey: DynamicKey(stringValue: "handle")!)
+            }
+            if let storageId = storageId {
+                try container.encode(storageId, forKey: DynamicKey(stringValue: "storage_id")!)
+            }
+        case .download(let path, let dest, let handle):
             try container.encode("download", forKey: DynamicKey(stringValue: "command")!)
             try container.encode(path, forKey: DynamicKey(stringValue: "path")!)
             try container.encode(dest, forKey: DynamicKey(stringValue: "dest")!)
-        case .upload(let src, let destPath):
+            if let handle = handle {
+                try container.encode(handle, forKey: DynamicKey(stringValue: "handle")!)
+            }
+        case .upload(let src, let destPath, let parentHandle):
             try container.encode("upload", forKey: DynamicKey(stringValue: "command")!)
             try container.encode(src, forKey: DynamicKey(stringValue: "src")!)
             try container.encode(destPath, forKey: DynamicKey(stringValue: "dest_path")!)
-        case .mkdir(let path, let name):
+            if let handle = parentHandle {
+                try container.encode(handle, forKey: DynamicKey(stringValue: "parent_handle")!)
+            }
+        case .mkdir(let path, let name, let parentHandle):
             try container.encode("mkdir", forKey: DynamicKey(stringValue: "command")!)
             try container.encode(path, forKey: DynamicKey(stringValue: "path")!)
             try container.encode(name, forKey: DynamicKey(stringValue: "name")!)
-        case .delete(let path):
+            if let parentHandle = parentHandle {
+                try container.encode(parentHandle, forKey: DynamicKey(stringValue: "parent_handle")!)
+            }
+        case .delete(let path, let handle):
             try container.encode("delete", forKey: DynamicKey(stringValue: "command")!)
             try container.encode(path, forKey: DynamicKey(stringValue: "path")!)
-        case .rename(let path, let newName):
+            if let handle = handle {
+                try container.encode(handle, forKey: DynamicKey(stringValue: "handle")!)
+            }
+        case .rename(let path, let newName, let handle):
             try container.encode("rename", forKey: DynamicKey(stringValue: "command")!)
             try container.encode(path, forKey: DynamicKey(stringValue: "path")!)
             try container.encode(newName, forKey: DynamicKey(stringValue: "new_name")!)
+            if let handle = handle {
+                try container.encode(handle, forKey: DynamicKey(stringValue: "handle")!)
+            }
         case .deviceInfo:
             try container.encode("device_info", forKey: DynamicKey(stringValue: "command")!)
         }
@@ -78,6 +99,58 @@ struct MTPResponse: Decodable {
     let status: String
     let data: MTPResponseData?
     let message: String?
+    
+    // Event fields (present if status == "event")
+    let eventType: String?
+    let handle: UInt32?
+    let storageId: UInt32?
+    
+    enum CodingKeys: String, CodingKey {
+        case id, status, data, message
+        case eventType = "event_type"
+        case handle
+        case storageId = "storage_id"
+    }
+}
+
+enum MTPEvent {
+    case objectAdded(handle: UInt32)
+    case objectRemoved(handle: UInt32)
+    case storeAdded(storageId: UInt32)
+    case storeRemoved(storageId: UInt32)
+    case storageInfoChanged(storageId: UInt32)
+    case objectInfoChanged(handle: UInt32)
+    case deviceInfoChanged
+    case deviceReset
+    case disconnected
+    case unknown(code: UInt16, params: [UInt32])
+    
+    init?(response: MTPResponse) {
+        guard response.status == "event", let type = response.eventType else { return nil }
+        
+        switch type {
+        case "ObjectAdded":
+            self = .objectAdded(handle: response.handle ?? 0)
+        case "ObjectRemoved":
+            self = .objectRemoved(handle: response.handle ?? 0)
+        case "StoreAdded":
+            self = .storeAdded(storageId: response.storageId ?? 0)
+        case "StoreRemoved":
+            self = .storeRemoved(storageId: response.storageId ?? 0)
+        case "StorageInfoChanged":
+            self = .storageInfoChanged(storageId: response.storageId ?? 0)
+        case "ObjectInfoChanged":
+            self = .objectInfoChanged(handle: response.handle ?? 0)
+        case "DeviceInfoChanged":
+            self = .deviceInfoChanged
+        case "DeviceReset":
+            self = .deviceReset
+        case "Disconnected":
+            self = .disconnected
+        default:
+            self = .unknown(code: 0, params: []) // FIXME: Add code/params if needed
+        }
+    }
 }
 
 struct MTPProgressEntry: Codable {
@@ -159,14 +232,17 @@ struct MTPFileEntry: Codable, Identifiable {
     let size: UInt64
     let dateModified: String
     let fileExtension: String
+    let handle: UInt32
+    let storageId: UInt32
 
     var id: String { path }
 
     enum CodingKeys: String, CodingKey {
-        case name, path, size
+        case name, path, size, handle
         case isDirectory = "is_directory"
         case dateModified = "date_modified"
         case fileExtension = "file_extension"
+        case storageId = "storage_id"
     }
 }
 

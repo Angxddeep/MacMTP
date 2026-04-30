@@ -4,6 +4,8 @@ struct FileItem: Identifiable, Hashable {
     let id: String // Use path as unique identifier
     let name: String
     let path: String
+    let handle: UInt32
+    let storageId: UInt32
     let isDirectory: Bool
     let size: Int64
     let dateModified: Date

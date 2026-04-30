@@ -4,12 +4,20 @@ import Combine
 @MainActor
 class MTPBrowserViewModel: ObservableObject {
     @Published var currentPath: String = "/Internal Storage"
+    @Published var currentHandle: UInt32? = nil
+    @Published var currentStorageId: UInt32? = nil
     @Published var files: [FileItem] = []
     @Published var isLoading = false
     @Published var errorMessage: String? = nil
     @Published var isConnected = false
 
-    private var history: [String] = []
+    private struct NavigationState: Equatable {
+        let path: String
+        let handle: UInt32?
+        let storageId: UInt32?
+    }
+
+    private var history: [NavigationState] = []
     private var historyIndex: Int = -1
     private let bridge = MTPBridge()
     private let transferStore = TransferProgressStore.shared
@@ -19,7 +27,8 @@ class MTPBrowserViewModel: ObservableObject {
     var canGoForward: Bool { historyIndex < history.count - 1 }
 
     init() {
-        history = ["/Internal Storage"]
+        let initial = NavigationState(path: "/Internal Storage", handle: nil, storageId: nil)
+        history = [initial]
         historyIndex = 0
     }
 
@@ -31,9 +40,35 @@ class MTPBrowserViewModel: ObservableObject {
         do {
             try await bridge.connect()
             isConnected = true
+            startEventListening()
             loadFiles()
         } catch {
             errorMessage = "Failed to connect to MTP daemon: \(error.localizedDescription)"
+        }
+    }
+
+    private func startEventListening() {
+        Task {
+            for await event in bridge.events {
+                handleEvent(event)
+            }
+        }
+    }
+
+    private func handleEvent(_ event: MTPEvent) {
+        switch event {
+        case .objectAdded, .objectRemoved, .objectInfoChanged, .storeAdded, .storeRemoved, .storageInfoChanged:
+            // For now, just refresh the current view
+            loadFiles()
+        case .deviceReset, .disconnected:
+            isConnected = false
+            hasConnected = false
+            errorMessage = "Device disconnected"
+            files = []
+        case .deviceInfoChanged:
+            break
+        case .unknown:
+            break
         }
     }
 
@@ -43,32 +78,45 @@ class MTPBrowserViewModel: ObservableObject {
         hasConnected = false
     }
 
-    func navigateTo(path: String) {
+    func navigateTo(path: String, handle: UInt32? = nil, storageId: UInt32? = nil) {
         if historyIndex < history.count - 1 {
             history = Array(history.prefix(historyIndex + 1))
         }
-        history.append(path)
+        let state = NavigationState(path: path, handle: handle, storageId: storageId)
+        history.append(state)
         historyIndex = history.count - 1
+        
         currentPath = path
+        currentHandle = handle
+        currentStorageId = storageId
+        
         loadFiles()
     }
 
     func navigateBack() {
         guard canGoBack else { return }
         historyIndex -= 1
-        currentPath = history[historyIndex]
+        let state = history[historyIndex]
+        currentPath = state.path
+        currentHandle = state.handle
+        currentStorageId = state.storageId
         loadFiles()
     }
 
     func navigateForward() {
         guard canGoForward else { return }
         historyIndex += 1
-        currentPath = history[historyIndex]
+        let state = history[historyIndex]
+        currentPath = state.path
+        currentHandle = state.handle
+        currentStorageId = state.storageId
         loadFiles()
     }
 
     func navigateUp() {
         if currentPath != "/Internal Storage" && currentPath != "/" {
+            // Finding parent handle is hard without a full tree, 
+            // so we fallback to path-based navigation for "Up"
             let parentPath = (currentPath as NSString).deletingLastPathComponent
             navigateTo(path: parentPath.isEmpty ? "/" : parentPath)
         }
@@ -86,13 +134,15 @@ class MTPBrowserViewModel: ObservableObject {
 
         Task {
             do {
-                let entries = try await bridge.listFiles(path: currentPath)
+                let entries = try await bridge.listFiles(path: currentPath, handle: currentHandle, storageId: currentStorageId)
                 let items = entries.map { entry -> FileItem in
                     let date = Self.parseDate(entry.dateModified)
                     return FileItem(
                         id: entry.path,
                         name: entry.name,
                         path: entry.path,
+                        handle: entry.handle,
+                        storageId: entry.storageId,
                         isDirectory: entry.isDirectory,
                         size: Int64(entry.size),
                         dateModified: date,
@@ -110,16 +160,15 @@ class MTPBrowserViewModel: ObservableObject {
     }
 
     /// Download a file from the MTP device to a local path.
-    func downloadFile(devicePath: String, localPath: String, displayName: String? = nil) async throws {
-        let name = displayName ?? (devicePath as NSString).lastPathComponent
+    func downloadFile(_ item: FileItem, localPath: String) async throws {
         let jobID = transferStore.startJob(
-            title: "Downloading \(name)",
+            title: "Downloading \(item.name)",
             detail: localPath,
-            totalBytes: nil
+            totalBytes: item.size
         )
 
         do {
-            _ = try await bridge.download(path: devicePath, to: localPath) { progress in
+            _ = try await bridge.download(path: item.path, handle: item.handle, to: localPath) { progress in
                 Task { @MainActor in
                     self.transferStore.updateJob(jobID, completedBytes: progress.bytes)
                 }
@@ -184,19 +233,19 @@ class MTPBrowserViewModel: ObservableObject {
 
     /// Create a directory on the MTP device.
     func createDirectory(name: String) async throws {
-        try await bridge.mkdir(parentPath: currentPath, name: name)
+        try await bridge.mkdir(parentPath: currentPath, name: name, parentHandle: currentHandle)
         loadFiles()
     }
 
     /// Delete a file or folder on the MTP device.
-    func deleteItem(path: String) async throws {
-        try await bridge.delete(path: path)
+    func deleteItem(_ item: FileItem) async throws {
+        try await bridge.delete(path: item.path, handle: item.handle)
         loadFiles()
     }
 
     /// Rename a file or folder on the MTP device.
-    func renameItem(path: String, newName: String) async throws {
-        try await bridge.rename(path: path, newName: newName)
+    func renameItem(_ item: FileItem, newName: String) async throws {
+        try await bridge.rename(path: item.path, newName: newName, handle: item.handle)
         loadFiles()
     }
 
@@ -236,7 +285,7 @@ class MTPBrowserViewModel: ObservableObject {
         )
 
         do {
-            _ = try await bridge.upload(localPath: localPath, to: devicePath) { progress in
+            _ = try await bridge.upload(localPath: localPath, to: devicePath, parentHandle: currentHandle) { progress in
                 Task { @MainActor in
                     self.transferStore.updateJob(jobID, completedBytes: progress.bytes)
                 }

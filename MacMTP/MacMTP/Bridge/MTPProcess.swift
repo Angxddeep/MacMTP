@@ -23,11 +23,14 @@ final class MTPProcess: @unchecked Sendable {
     private var buffer = Data()
     private let bufferLock = NSLock()
 
+    /// Handler for unsolicited MTP events from the device.
+    var eventHandler: (@Sendable (MTPEvent) -> Void)?
+
     /// Path to the mtp-daemon binary. Set this before calling `start()`.
     static var binaryPath: String?
 
     /// Per-request timeout in seconds.
-    static let requestTimeout: TimeInterval = 30
+    nonisolated static let requestTimeout: TimeInterval = 30
 
     var isRunning: Bool {
         lifecycleLock.withLock {
@@ -224,6 +227,13 @@ final class MTPProcess: @unchecked Sendable {
                     continue
                 }
 
+                if response.status == "event" {
+                    if let event = MTPEvent(response: response) {
+                        eventHandler?(event)
+                    }
+                    continue
+                }
+
                 lock.lock()
                 let pending = pendingRequests.removeValue(forKey: id)
                 lock.unlock()
@@ -261,24 +271,47 @@ private struct RequestWrapper: Encodable {
         case .listStorages:
             self.command = "list_storages"
             self.extra = [:]
-        case .listFiles(let path):
+        case .listFiles(let path, let handle, let storageId):
             self.command = "list_files"
-            self.extra = ["path": .string(path)]
-        case .download(let path, let dest):
+            self.extra = [
+                "path": .string(path),
+                "handle": .uint32(handle),
+                "storage_id": .uint32(storageId)
+            ]
+        case .download(let path, let dest, let handle):
             self.command = "download"
-            self.extra = ["path": .string(path), "dest": .string(dest)]
-        case .upload(let src, let destPath):
+            self.extra = [
+                "path": .string(path),
+                "dest": .string(dest),
+                "handle": .uint32(handle)
+            ]
+        case .upload(let src, let destPath, let parentHandle):
             self.command = "upload"
-            self.extra = ["src": .string(src), "dest_path": .string(destPath)]
-        case .mkdir(let path, let name):
+            self.extra = [
+                "src": .string(src),
+                "dest_path": .string(destPath),
+                "parent_handle": .uint32(parentHandle)
+            ]
+        case .mkdir(let path, let name, let parentHandle):
             self.command = "mkdir"
-            self.extra = ["path": .string(path), "name": .string(name)]
-        case .delete(let path):
+            self.extra = [
+                "path": .string(path),
+                "name": .string(name),
+                "parent_handle": .uint32(parentHandle)
+            ]
+        case .delete(let path, let handle):
             self.command = "delete"
-            self.extra = ["path": .string(path)]
-        case .rename(let path, let newName):
+            self.extra = [
+                "path": .string(path),
+                "handle": .uint32(handle)
+            ]
+        case .rename(let path, let newName, let handle):
             self.command = "rename"
-            self.extra = ["path": .string(path), "new_name": .string(newName)]
+            self.extra = [
+                "path": .string(path),
+                "new_name": .string(newName),
+                "handle": .uint32(handle)
+            ]
         case .deviceInfo:
             self.command = "device_info"
             self.extra = [:]
@@ -312,11 +345,18 @@ private struct DynamicKey: CodingKey {
 
 private enum AnyEncodableValue: Encodable {
     case string(String)
+    case uint32(UInt32?)
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.singleValueContainer()
         switch self {
         case .string(let v): try container.encode(v)
+        case .uint32(let v):
+            if let v = v {
+                try container.encode(v)
+            } else {
+                try container.encodeNil()
+            }
         }
     }
 }

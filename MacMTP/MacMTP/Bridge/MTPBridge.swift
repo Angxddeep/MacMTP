@@ -11,6 +11,17 @@ import Foundation
 /// ```
 final class MTPBridge: @unchecked Sendable {
     private let process = MTPProcess()
+    private var eventContinuation: AsyncStream<MTPEvent>.Continuation?
+
+    /// A stream of unsolicited MTP events from the device.
+    lazy var events: AsyncStream<MTPEvent> = {
+        AsyncStream { continuation in
+            self.eventContinuation = continuation
+            process.eventHandler = { [weak self] event in
+                self?.eventContinuation?.yield(event)
+            }
+        }
+    }()
 
     /// Set this to the path of the compiled mtp-daemon binary before using.
     static var daemonPath: String? {
@@ -66,8 +77,8 @@ final class MTPBridge: @unchecked Sendable {
     /// List files and folders at the given MTP path.
     ///
     /// Paths look like: `/Internal Storage/DCIM/Camera`
-    func listFiles(path: String) async throws -> [MTPFileEntry] {
-        let response = try await send(.listFiles(path: path))
+    func listFiles(path: String, handle: UInt32? = nil, storageId: UInt32? = nil) async throws -> [MTPFileEntry] {
+        let response = try await send(.listFiles(path: path, handle: handle, storageId: storageId))
         guard response.status == "ok" else {
             throw MTPError.requestFailed(response.message ?? "list_files failed")
         }
@@ -80,11 +91,12 @@ final class MTPBridge: @unchecked Sendable {
     /// Download a file from the MTP device to a local destination.
     func download(
         path: String,
+        handle: UInt32? = nil,
         to localDest: String,
         onProgress: (@Sendable (MTPProgressEntry) -> Void)? = nil
     ) async throws -> Int {
         let response = try await send(
-            .download(path: path, dest: localDest),
+            .download(path: path, dest: localDest, handle: handle),
             timeout: nil,
             onProgress: onProgress
         )
@@ -102,10 +114,11 @@ final class MTPBridge: @unchecked Sendable {
     func upload(
         localPath: String,
         to devicePath: String,
+        parentHandle: UInt32? = nil,
         onProgress: (@Sendable (MTPProgressEntry) -> Void)? = nil
     ) async throws -> Int {
         let response = try await send(
-            .upload(src: localPath, destPath: devicePath),
+            .upload(src: localPath, destPath: devicePath, parentHandle: parentHandle),
             timeout: nil,
             onProgress: onProgress
         )
@@ -120,24 +133,24 @@ final class MTPBridge: @unchecked Sendable {
     }
 
     /// Create a directory on the MTP device.
-    func mkdir(parentPath: String, name: String) async throws {
-        let response = try await send(.mkdir(path: parentPath, name: name))
+    func mkdir(parentPath: String, name: String, parentHandle: UInt32? = nil) async throws {
+        let response = try await send(.mkdir(path: parentPath, name: name, parentHandle: parentHandle))
         guard response.status == "ok" else {
             throw MTPError.requestFailed(response.message ?? "mkdir failed")
         }
     }
 
     /// Delete a file or folder on the MTP device.
-    func delete(path: String) async throws {
-        let response = try await send(.delete(path: path))
+    func delete(path: String, handle: UInt32? = nil) async throws {
+        let response = try await send(.delete(path: path, handle: handle))
         guard response.status == "ok" else {
             throw MTPError.requestFailed(response.message ?? "delete failed")
         }
     }
 
     /// Rename a file or folder on the MTP device.
-    func rename(path: String, newName: String) async throws {
-        let response = try await send(.rename(path: path, newName: newName))
+    func rename(path: String, newName: String, handle: UInt32? = nil) async throws {
+        let response = try await send(.rename(path: path, newName: newName, handle: handle))
         guard response.status == "ok" else {
             throw MTPError.requestFailed(response.message ?? "rename failed")
         }

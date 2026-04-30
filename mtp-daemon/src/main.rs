@@ -2,7 +2,7 @@ mod protocol;
 
 use bytes::Bytes;
 use futures::stream;
-use mtp_rs::mtp::{MtpDevice, NewObjectInfo, Storage};
+use mtp_rs::mtp::{DeviceEvent, MtpDevice, NewObjectInfo, Storage};
 use mtp_rs::ptp::{AssociationType, ObjectInfo};
 use protocol::*;
 use std::io::{self, BufRead, Write};
@@ -63,6 +63,62 @@ fn progress(id: u64, bytes: u64, total: Option<u64>) {
             }),
         },
     );
+}
+
+fn send_event(event: MtpEvent) {
+    send_response(0, ResponseStatus::Event(event));
+}
+
+async fn event_loop(device: MtpDevice, state: Arc<RwLock<DaemonState>>) {
+    loop {
+        match device.next_event().await {
+            Ok(event) => {
+                let proto_event = match event {
+                    DeviceEvent::ObjectAdded { handle } => MtpEvent::ObjectAdded { handle: handle.0 },
+                    DeviceEvent::ObjectRemoved { handle } => {
+                        MtpEvent::ObjectRemoved { handle: handle.0 }
+                    }
+                    DeviceEvent::StoreAdded { storage_id } => {
+                        MtpEvent::StoreAdded {
+                            storage_id: storage_id.0,
+                        }
+                    }
+                    DeviceEvent::StoreRemoved { storage_id } => {
+                        MtpEvent::StoreRemoved {
+                            storage_id: storage_id.0,
+                        }
+                    }
+                    DeviceEvent::StorageInfoChanged { storage_id } => {
+                        MtpEvent::StorageInfoChanged {
+                            storage_id: storage_id.0,
+                        }
+                    }
+                    DeviceEvent::ObjectInfoChanged { handle } => {
+                        MtpEvent::ObjectInfoChanged { handle: handle.0 }
+                    }
+                    DeviceEvent::DeviceInfoChanged => MtpEvent::DeviceInfoChanged,
+                    DeviceEvent::DeviceReset => MtpEvent::DeviceReset,
+                    DeviceEvent::Unknown { code, params } => MtpEvent::Unknown {
+                        code,
+                        params: params.to_vec(),
+                    },
+                };
+                send_event(proto_event);
+            }
+            Err(e) => {
+                eprintln!("Event loop error: {}", e);
+                let mut st = state.write().await;
+                // Only clear if the device in state is the same one we were polling.
+                // We check if the device in state is still present.
+                if st.device.is_some() {
+                    st.device = None;
+                    st.storages.clear();
+                    send_event(MtpEvent::DeviceReset); // Notify client that device is gone
+                }
+                break;
+            }
+        }
+    }
 }
 
 async fn ensure_connected(state: &Arc<RwLock<DaemonState>>) -> Result<(), String> {
@@ -151,8 +207,15 @@ async fn ensure_connected(state: &Arc<RwLock<DaemonState>>) -> Result<(), String
         .map_err(|e| format!("Failed to list storages: {e}"))?;
 
     let mut st = state.write().await;
-    st.device = Some(device);
+    st.device = Some(device.clone());
     st.storages = storages;
+
+    // Start event loop for the newly connected device
+    let state_clone = Arc::clone(state);
+    tokio::spawn(async move {
+        event_loop(device, state_clone).await;
+    });
+
     Ok(())
 }
 
@@ -246,11 +309,10 @@ async fn handle_request(req: Request, id: u64, state: &Arc<RwLock<DaemonState>>)
             let entries: Vec<StorageEntry> = st
                 .storages
                 .iter()
-                .enumerate()
-                .map(|(i, s)| {
+                .map(|s| {
                     let info = s.info();
                     StorageEntry {
-                        id: i as u32,
+                        id: s.id().0,
                         description: info.description.clone(),
                         free_space: info.free_space_bytes,
                         total_space: info.max_capacity,
@@ -260,21 +322,50 @@ async fn handle_request(req: Request, id: u64, state: &Arc<RwLock<DaemonState>>)
             ok(id, serde_json::to_value(entries).unwrap());
         }
 
-        Request::ListFiles { path } => {
+        Request::ListFiles {
+            path,
+            handle,
+            storage_id,
+        } => {
             if let Err(e) = ensure_connected(&state).await {
                 err(id, e);
                 return;
             }
             let st = state.read().await;
-            let storage = match find_storage_for_path(&st.storages, &path) {
-                Some(s) => s,
-                None => {
-                    err(id, "No storage found for path");
-                    return;
-                }
-            };
 
-            let parent_handle = find_dir_handle(storage, &path).await;
+            let (storage, parent_handle) = if let Some(h) = handle {
+                let s = if let Some(sid) = storage_id {
+                    st.storages.iter().find(|s| s.id().0 == sid)
+                } else {
+                    find_storage_for_path(&st.storages, &path)
+                };
+
+                match s {
+                    Some(s) => (s, Some(mtp_rs::ptp::ObjectHandle(h))),
+                    None => {
+                        err(id, "No storage found");
+                        return;
+                    }
+                }
+            } else if let Some(sid) = storage_id {
+                let s = st.storages.iter().find(|s| s.id().0 == sid);
+                match s {
+                    Some(s) => (s, None),
+                    None => {
+                        err(id, "No storage found with given ID");
+                        return;
+                    }
+                }
+            } else {
+                let s = match find_storage_for_path(&st.storages, &path) {
+                    Some(s) => s,
+                    None => {
+                        err(id, "No storage found for path");
+                        return;
+                    }
+                };
+                (s, find_dir_handle(s, &path).await)
+            };
 
             let objects = match storage.list_objects(parent_handle).await {
                 Ok(objs) => objs,
@@ -306,43 +397,64 @@ async fn handle_request(req: Request, id: u64, state: &Arc<RwLock<DaemonState>>)
                     size: obj.size,
                     date_modified: obj.modified.and_then(|d| d.format()).unwrap_or_default(),
                     file_extension: ext,
+                    handle: obj.handle.0,
+                    storage_id: storage.id().0,
                 });
             }
             ok(id, serde_json::to_value(entries).unwrap());
         }
 
-        Request::Download { path, dest } => {
+        Request::Download { path, dest, handle } => {
             if let Err(e) = ensure_connected(&state).await {
                 err(id, e);
                 return;
             }
             let st = state.read().await;
-            let storage = match find_storage_for_path(&st.storages, &path) {
-                Some(s) => s,
-                None => {
-                    err(id, "No storage found for path");
-                    return;
-                }
-            };
 
-            let parent = parent_path(&path);
-            let target_name = file_name(&path);
-
-            let parent_handle = find_dir_handle(storage, parent).await;
-            let objects = match storage.list_objects(parent_handle).await {
-                Ok(objs) => objs,
-                Err(e) => {
-                    err(id, format!("Failed to list directory: {e}"));
-                    return;
+            let (storage, obj_handle, size) = if let Some(h) = handle {
+                let mut found = None;
+                for s in &st.storages {
+                    if let Ok(info) = s.get_object_info(mtp_rs::ptp::ObjectHandle(h)).await {
+                        found = Some((s, mtp_rs::ptp::ObjectHandle(h), info.size));
+                        break;
+                    }
                 }
-            };
-
-            let obj = match objects.into_iter().find(|o| o.filename == target_name) {
-                Some(o) => o,
-                None => {
-                    err(id, format!("File not found: {path}"));
-                    return;
+                match found {
+                    Some(f) => f,
+                    None => {
+                        err(id, format!("Object not found with handle: {h}"));
+                        return;
+                    }
                 }
+            } else {
+                let storage = match find_storage_for_path(&st.storages, &path) {
+                    Some(s) => s,
+                    None => {
+                        err(id, "No storage found for path");
+                        return;
+                    }
+                };
+
+                let parent = parent_path(&path);
+                let target_name = file_name(&path);
+
+                let parent_handle = find_dir_handle(storage, parent).await;
+                let objects = match storage.list_objects(parent_handle).await {
+                    Ok(objs) => objs,
+                    Err(e) => {
+                        err(id, format!("Failed to list directory: {e}"));
+                        return;
+                    }
+                };
+
+                let obj = match objects.into_iter().find(|o| o.filename == target_name) {
+                    Some(o) => o,
+                    None => {
+                        err(id, format!("File not found: {path}"));
+                        return;
+                    }
+                };
+                (storage, obj.handle, obj.size)
             };
 
             let mut file = match tokio::fs::File::create(&dest).await {
@@ -353,7 +465,7 @@ async fn handle_request(req: Request, id: u64, state: &Arc<RwLock<DaemonState>>)
                 }
             };
 
-            let mut stream = match storage.download_stream(obj.handle).await {
+            let mut stream = match storage.download_stream(obj_handle).await {
                 Ok(s) => s,
                 Err(e) => {
                     err(id, format!("Download failed: {e}"));
@@ -361,7 +473,7 @@ async fn handle_request(req: Request, id: u64, state: &Arc<RwLock<DaemonState>>)
                 }
             };
 
-            progress(id, 0, Some(obj.size));
+            progress(id, 0, Some(size));
             let mut downloaded = 0;
 
             while let Some(chunk_result) = stream.next_chunk().await {
@@ -372,7 +484,7 @@ async fn handle_request(req: Request, id: u64, state: &Arc<RwLock<DaemonState>>)
                             return;
                         }
                         downloaded += chunk.len() as u64;
-                        progress(id, downloaded, Some(obj.size));
+                        progress(id, downloaded, Some(size));
                     }
                     Err(e) => {
                         err(id, format!("Download stream error: {e}"));
@@ -384,7 +496,11 @@ async fn handle_request(req: Request, id: u64, state: &Arc<RwLock<DaemonState>>)
             ok(id, serde_json::json!({"bytes": downloaded, "dest": dest}));
         }
 
-        Request::Upload { src, dest_path } => {
+        Request::Upload {
+            src,
+            dest_path,
+            parent_handle,
+        } => {
             if let Err(e) = ensure_connected(&state).await {
                 err(id, e);
                 return;
@@ -415,8 +531,12 @@ async fn handle_request(req: Request, id: u64, state: &Arc<RwLock<DaemonState>>)
                 }
             };
 
-            let parent = parent_path(&dest_path);
-            let parent_handle = find_dir_handle(storage, parent).await;
+            let parent_handle = if let Some(h) = parent_handle {
+                Some(mtp_rs::ptp::ObjectHandle(h))
+            } else {
+                let parent = parent_path(&dest_path);
+                find_dir_handle(storage, parent).await
+            };
 
             let fname = file_name(&dest_path).to_string();
             let info = NewObjectInfo::file(&fname, size);
@@ -448,7 +568,11 @@ async fn handle_request(req: Request, id: u64, state: &Arc<RwLock<DaemonState>>)
             }
         }
 
-        Request::Mkdir { path, name } => {
+        Request::Mkdir {
+            path,
+            name,
+            parent_handle,
+        } => {
             if let Err(e) = ensure_connected(&state).await {
                 err(id, e);
                 return;
@@ -462,71 +586,117 @@ async fn handle_request(req: Request, id: u64, state: &Arc<RwLock<DaemonState>>)
                 }
             };
 
-            let parent_handle = find_dir_handle(storage, &path).await;
+            let p_handle = if let Some(ph) = parent_handle {
+                Some(mtp_rs::ptp::ObjectHandle(ph))
+            } else {
+                find_dir_handle(storage, &path).await
+            };
 
-            match storage.create_folder(parent_handle, &name).await {
+            match storage.create_folder(p_handle, &name).await {
                 Ok(_) => ok(id, serde_json::json!({"created": name})),
                 Err(e) => err(id, format!("mkdir failed: {e}")),
             }
         }
 
-        Request::Delete { path } => {
+        Request::Delete { path, handle } => {
             if let Err(e) = ensure_connected(&state).await {
                 err(id, e);
                 return;
             }
             let st = state.read().await;
-            let storage = match find_storage_for_path(&st.storages, &path) {
-                Some(s) => s,
-                None => {
-                    err(id, "No storage found for path");
-                    return;
+
+            let (storage, obj_handle) = if let Some(h) = handle {
+                let mut found = None;
+                for s in &st.storages {
+                    if let Ok(_) = s.get_object_info(mtp_rs::ptp::ObjectHandle(h)).await {
+                        found = Some((s, mtp_rs::ptp::ObjectHandle(h)));
+                        break;
+                    }
                 }
+                match found {
+                    Some(f) => f,
+                    None => {
+                        err(id, format!("Object not found with handle: {h}"));
+                        return;
+                    }
+                }
+            } else {
+                let storage = match find_storage_for_path(&st.storages, &path) {
+                    Some(s) => s,
+                    None => {
+                        err(id, "No storage found for path");
+                        return;
+                    }
+                };
+
+                let parent = parent_path(&path);
+                let target_name = file_name(&path);
+
+                let h = match find_object_handle(storage, parent, target_name).await {
+                    Some(h) => h,
+                    None => {
+                        err(id, format!("Object not found: {path}"));
+                        return;
+                    }
+                };
+                (storage, h)
             };
 
-            let parent = parent_path(&path);
-            let target_name = file_name(&path);
-
-            let handle = match find_object_handle(storage, parent, target_name).await {
-                Some(h) => h,
-                None => {
-                    err(id, format!("Object not found: {path}"));
-                    return;
-                }
-            };
-
-            match storage.delete(handle).await {
+            match storage.delete(obj_handle).await {
                 Ok(_) => ok(id, serde_json::json!({"deleted": path})),
                 Err(e) => err(id, format!("Delete failed: {e}")),
             }
         }
 
-        Request::Rename { path, new_name } => {
+        Request::Rename {
+            path,
+            new_name,
+            handle,
+        } => {
             if let Err(e) = ensure_connected(&state).await {
                 err(id, e);
                 return;
             }
             let st = state.read().await;
-            let storage = match find_storage_for_path(&st.storages, &path) {
-                Some(s) => s,
-                None => {
-                    err(id, "No storage found for path");
-                    return;
+
+            let (storage, obj_handle) = if let Some(h) = handle {
+                let mut found = None;
+                for s in &st.storages {
+                    if let Ok(_) = s.get_object_info(mtp_rs::ptp::ObjectHandle(h)).await {
+                        found = Some((s, mtp_rs::ptp::ObjectHandle(h)));
+                        break;
+                    }
                 }
+                match found {
+                    Some(f) => f,
+                    None => {
+                        err(id, format!("Object not found with handle: {h}"));
+                        return;
+                    }
+                }
+            } else {
+                let storage = match find_storage_for_path(&st.storages, &path) {
+                    Some(s) => s,
+                    None => {
+                        err(id, "No storage found for path");
+                        return;
+                    }
+                };
+
+                let parent = parent_path(&path);
+                let target_name = file_name(&path);
+
+                let h = match find_object_handle(storage, parent, target_name).await {
+                    Some(h) => h,
+                    None => {
+                        err(id, format!("Object not found: {path}"));
+                        return;
+                    }
+                };
+                (storage, h)
             };
 
-            let parent = parent_path(&path);
-            let target_name = file_name(&path);
-
-            let handle = match find_object_handle(storage, parent, target_name).await {
-                Some(h) => h,
-                None => {
-                    err(id, format!("Object not found: {path}"));
-                    return;
-                }
-            };
-
-            match storage.rename(handle, &new_name).await {
+            match storage.rename(obj_handle, &new_name).await {
                 Ok(_) => ok(id, serde_json::json!({"renamed": new_name})),
                 Err(e) => err(id, format!("Rename failed: {e}")),
             }

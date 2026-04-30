@@ -84,6 +84,8 @@ class LocalBrowserViewModel: ObservableObject {
                         id: fullPath,
                         name: item,
                         path: fullPath,
+                        handle: 0,
+                        storageId: 0,
                         isDirectory: isDirectory,
                         size: size,
                         dateModified: dateModified,
@@ -153,11 +155,21 @@ class LocalBrowserViewModel: ObservableObject {
                         forName: item.name,
                         inDirectory: directoryPath
                     )
-                    try await mtpViewModel.downloadFile(
-                        devicePath: item.path,
-                        localPath: destinationURL.path,
-                        displayName: item.name
+                    
+                    // Create a dummy FileItem from the drag item
+                    let mtpFile = FileItem(
+                        id: item.path,
+                        name: item.name,
+                        path: item.path,
+                        handle: item.handle,
+                        storageId: 0,
+                        isDirectory: false,
+                        size: 0,
+                        dateModified: Date(),
+                        fileExtension: (item.name as NSString).pathExtension
                     )
+                    
+                    try await mtpViewModel.downloadFile(mtpFile, localPath: destinationURL.path)
                 }
             }
             errorMessage = nil

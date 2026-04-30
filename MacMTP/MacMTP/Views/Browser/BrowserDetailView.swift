@@ -71,8 +71,6 @@ struct MTPBrowserDetailView: View {
             }
         )
         .navigationTitle("Phone")
-        .task {
-            await viewModel.connect()
-        }
     }
 }
+
